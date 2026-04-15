@@ -1,0 +1,386 @@
+library(Seurat)
+library(sf)
+library(dplyr)
+library(ggplot2)
+library(patchwork)
+library(SeuratData)
+library(dbscan)
+library(pheatmap)
+library(clustree)
+library(dplyr)
+library(purrr)
+library(clusterProfiler)
+library(org.Mm.eg.db)
+library(SeuratWrappers)
+library(Banksy)
+
+library(clusterProfiler)
+
+
+#################################### FUNCTIONS ################################################################################
+SpatiallyBinSeurat <- function(seurat_obj, grid_size, assay = "Spatial", layer = "counts") {
+  
+  #get coordinates and counts
+  counts <- GetAssayData(seurat_obj, assay = assay, layer = layer)
+  current_cells <- colnames(counts)
+  all_coords <- GetTissueCoordinates(seurat_obj)[, c("x", "y")]
+  coords <- all_coords[current_cells, ]
+  spatial_df <- cbind(coords, as.data.frame(t(counts)))
+  points_sf <- st_as_sf(spatial_df, coords = c("x", "y"), remove = FALSE)
+  
+  #create grid
+  grid <- st_make_grid(points_sf, cellsize = grid_size, square = FALSE) %>%
+    st_as_sf() %>%
+    mutate(grid_id = 1:n()) # add a unique ID to each bin
+  
+  #get counts
+  points_with_grid_id <- st_join(points_sf, grid, join = st_intersects)
+  binned_counts_df <- points_with_grid_id %>%
+    st_drop_geometry() %>% #remove geometry column
+    group_by(grid_id) %>%
+    # select only the gene columns to sum them
+    summarise(across(all_of(rownames(counts)), sum), .groups = 'drop')#sums all points based on group id
+  
+  binned_counts_matrix <- as.matrix(t(binned_counts_df[, -1])) #transpose and keep all col except the first one
+  colnames(binned_counts_matrix) <- paste0("bin_", binned_counts_df$grid_id)
+  
+  #get centroid for each grid 
+  grid_centroids <- st_centroid(grid)
+  grid_coords <- as.data.frame(st_coordinates(grid_centroids))
+  colnames(grid_coords) <- c("x", "y")
+  grid_coords$grid_id <- grid$grid_id
+  
+  # remove grids without data 
+  bins_with_data <- binned_counts_df$grid_id
+  grid_coords_filtered <- grid_coords[grid_coords$grid_id %in% bins_with_data, ] #only keep centroids of bins with data 
+  rownames(grid_coords_filtered) <- paste0("bin_", grid_coords_filtered$grid_id)
+  binned_counts_matrix <- binned_counts_matrix[, rownames(grid_coords_filtered)]
+  
+  #create new seurat obj
+  binned_assay <- CreateAssayObject(counts = binned_counts_matrix)
+  binned_seurat <- CreateSeuratObject(counts = binned_assay, assay = "Spatial")
+  binned_seurat@images$image <- new(
+    Class = 'SlideSeq',
+    assay = "Spatial",
+    key = "image_",
+    coordinates = grid_coords_filtered
+    
+  )
+  
+  return(binned_seurat)
+  
+}
+
+createBanksyBin <- function(seurat_obj, assay){
+  DefaultAssay(seurat_obj) <- assay
+  banksy_bin <- RunBanksy(seurat_obj, lambda = 0.2, assay = assay, slot = 'counts', features = 'variable', k_geom = 15) 
+  
+  banksy_bin <- NormalizeData(
+    banksy_bin,
+    assay = assay,
+    normalization.method = "LogNormalize",
+    scale.factor = 1e4
+  )
+    
+    banksy_bin <- NormalizeData(
+      banksy_bin,
+      assay = 'BANKSY',
+      normalization.method = "LogNormalize",
+      scale.factor = 1e4
+    
+  )
+  return(banksy_bin)
+  
+}
+
+getDotPlots <- function(seurat_obj, assay, markers){
+  ## ignore housekeeping genes
+  markers_clean <- markers[
+    !grepl("^Gm", markers$gene) &
+      !grepl("Rik", markers$gene) &
+      !grepl("^mt-", markers$gene), 
+  ]
+  
+  all_cluster_names <- levels(seurat_obj)
+  
+  for (cluster_name in all_cluster_names){
+    cat("Cluster: ", cluster_name, "\n")
+    top_genes_for_cluster <- markers_clean %>%
+      filter(cluster == cluster_name) %>%
+      top_n(n = 15, wt = avg_log2FC)
+    
+    if (nrow(top_genes_for_cluster) == 0){
+      message("no markers for this cluster at min.pct = 0.1")
+      next
+    }
+    
+    filename <- paste0("dotplot_", cluster_name,".pdf")
+    p <- DotPlot(seurat_obj, features = top_genes_for_cluster$gene, assay = assay) +
+      coord_flip()
+    pdf(filename)
+    print(p)
+    dev.off()
+  }
+  
+  
+}
+
+getHeatMap <- function(seurat_obj, assay, markers, n){
+  topN_markers <- markers %>%
+    group_by(cluster) %>%
+    top_n(n = n, wt = avg_log2FC)
+  
+  genes_for_heatmap <- topN_markers$gene
+  head(genes_for_heatmap)
+  
+  
+  avg_exp <- AverageExpression(
+    object       = seurat_obj,
+    features     = genes_for_heatmap,
+    assays       = "Spatial",                
+    group.by     = "BANKSY_snn_res.0.8",
+    slot         = "data",
+    exponentiate = FALSE,
+    return.seurat = FALSE
+  )
+  
+  avg_exp_matrix <- avg_exp$Spatial
+  avg_exp_matrix <- as.matrix(avg_exp_matrix)
+  head(avg_exp_matrix)
+  
+  pdf("heatmap.pdf",width = 6, height = 25)
+  print(pheatmap(avg_exp_matrix, 
+           scale = "row",
+           fontsize_row = 10,  
+           fontsize_col = 10))  
+  dev.off()
+}
+###################################### 1. LOAD DATA ######################################################################
+# load individual tiles or #integrated tiles:
+obj <- readRDS("")
+
+
+###################################### 2. SET TILE LIST ##########################################################
+# NOTE: skip to step 4 (BANKSY) if using integrated tiles
+
+# Tile list for T1-T4:
+
+## uninjured: 
+tile_list <- list(T1.U = t1.u, T2.U = t2.u, T3.U = t3.u, T4.U = t4.u)
+## 3dpi:
+tile_list <- list(T1.3 = t1.3, T2.3 = t2.3, T3.3 = t3.3, T4.3 = t4.3)
+## 7dpi:
+tile_list <- list(T1.7 = t1.7, T2.7 = t2.7, T3.7 = t3.7, T4.7 = t4.7)
+
+# Tile list for T5-T8:
+
+## 1dpi:
+tile_list <- list(T5.1 = t5.1, T6.1 = t6.1, T7.1 = t7.1, T8.1 = t8.1)
+## 14dpi:
+tile_list <- list(T5.14 = t5.14, T6.14 = t6.14, T7.14 = t7.14, T8.14 = t8.14)
+## 28dpi:
+tile_list <- list(T5.28 = t5.28, T6.28 = t6.28, T7.28 = t7.28, T8.28 = t8.28)
+
+###################################### 3. BINNING EACH TILE  ####################################################################
+
+# Bin each tile
+binned_list <- lapply(names(tile_list), function(name){
+  cat("Binning tile:", name, "\n")
+  SpatiallyBinSeurat(
+    seurat_obj =  tile_list[[name]],
+    grid_size = 50,
+    assay = "RNA"
+  )
+})
+
+names(binned_list) <- names(tile_list)
+
+# Merge bins together 
+merged_bin <- merge(
+  x = binned_list[[1]],
+  y = binned_list[2:length(binned_list)],
+  add.cells.ids = names(binned_list)
+)
+head(colnames(merged_bin))
+
+# Adjust spatial coordinates
+all_coords <- GetTissueCoordinates(merged_bin)
+margin <- 50
+
+max_x_tile1 <- max(GetTissueCoordinates(tile_list[[1]])$x)
+bins_tile2 <- grep("_2$", rownames(all_coords))
+all_coords[bins_tile2, "x"] <- all_coords[bins_tile2, "x"] + max_x_tile1 + margin
+merged_bin@images$image@coordinates <- all_coords
+
+merged_bin <- SCTransform(merged_bin, assay = "Spatial", verbose = FALSE)
+
+pdf("spatialdimplot_check_1.pdf")
+SpatialDimPlot(merged_bin, label = FALSE,  ncol = 1)
+dev.off()
+
+###################################### 4. BANKSY ############################################################################
+
+banksy_bin <- createBanksyBin(merged_bin,assay="Spatial") # if integrated tiles: merged_bin -> obj
+banksy_bin <- RunPCA(banksy_bin, assay = 'BANKSY', features = rownames(banksy_bin))
+
+###################################### 5. CLUSTREE #########################################################################
+DefaultAssay(banksy_bin)<- "BANKSY"
+
+banksy_bin <- FindNeighbors(banksy_bin, reduction = "pca", dims = 1:15)
+banksy_bin <- FindClusters(banksy_bin, resolution = seq(0.1, 1.0, 0.1)) # adjust resolution here
+
+# All resolution
+plotname = c("clustree_all_res_highlight.pdf")
+plot <- clustree::clustree(banksy_bin, prefix = "BANKSY_snn_res.", exprs  = "data") 
+ggsave(plotname, plot=plot, width = 20, height = 20)
+
+# Pick optimal resolution 
+banksy_bin$clustering_res <- banksy_bin$BANKSY_snn_res.0.8
+Idents(banksy_bin) <- banksy_bin$clustering_res
+
+
+###################################### 6. ANALYSIS ###########################################################################
+# Visualize UMAP
+banksy_bin <- RunUMAP(banksy_bin, reduction = "pca", dims = 1:15)
+
+pdf("umap_0.8_banksy.pdf")
+DimPlot(banksy_bin, reduction = "umap", label = TRUE)
+dev.off()
+
+# Check that there are still 4 images
+pdf("spatialdimplot_check_2.pdf")
+SpatialDimPlot(banksy_bin, label = FALSE,  ncol = 1)
+dev.off()
+
+# Check for batch affect 
+tile_info <- data.frame(row.names=colnames(banksy_bin), id=colnames(banksy_bin))
+unique(tile_info$id)
+tile_info$tile_id <- sub(".*_", "", tile_info$id) # creates new tile_id col
+banksy_bin <- AddMetaData(banksy_bin, metadata = tile_info)
+
+pdf("umap_banksytileID_res0.8.pdf", width = 10, height = 10)
+# NOTE: when dealing with integrated tiles, group.by = "sample_id_prefix"; else group.by = "tile_id"
+DimPlot(banksy_bin, group.by = "tile_id", label = TRUE, repel = TRUE) 
+dev.off()
+
+# Visualize spatially 
+pdf("spatialdimplot_banksy_res0.8.pdf")
+SpatialDimPlot(banksy_bin, label = FALSE,  ncol = 1)
+dev.off()
+
+# Get markers
+
+Idents(banksy_bin) <- banksy_bin$BANKSY_snn_res.0.8
+banksy_bin_markers <- FindAllMarkers(banksy_bin, 
+                                     assay = "Spatial", 
+                                     only.pos = T, min.pct = 0.1)
+# Remove housekeeper genes from markers
+markers_clean <- banksy_bin_markers[
+  !grepl("^Gm", banksy_bin_markers$gene) &
+    !grepl("Rik", banksy_bin_markers$gene) &
+    !grepl("^mt-", banksy_bin_markers$gene), 
+]
+
+write.csv(markers_clean, file = "res0.8_banksy_cluster_markers.csv")
+
+# Visualize Heat map 
+getHeatMap(banksy_bin, assay = "Spatial", markers_clean, n = 15)
+
+# Visualize DotPlot
+getDotPlots(banksy_bin, assay = "Spatial", markers_clean)
+
+
+# Find GO Terms for each cluster
+cluster_go_results <- compareCluster(
+  geneCluster = gene ~ cluster, # Uses the 'gene' and 'cluster' columns
+  data        = markers_clean,
+  fun         = "enrichGO",
+  OrgDb       = org.Mm.eg.db,
+  keyType     = 'SYMBOL',
+  ont         = "BP" 
+)
+
+pdf("GO_dotplot_per_cluster_integrated_res0.8.pdf", width = 12, height = 30)
+dotplot(cluster_go_results, showCategory = 5) +
+  ggtitle("Top 5 GO Terms per Cluster")
+dev.off()
+
+# Check that there are still 4 images
+pdf("spatialdimplot_check_3.pdf")
+SpatialDimPlot(banksy_bin, label = FALSE,  ncol = 1)
+dev.off()
+
+
+# INTEGRATED TILES ONLY: 
+timepoints <- sort(unique(banksy_bin$timepoint))
+
+# Visualize spatially per time point 
+for (tp in timepoints){
+  print(tp)
+  obj_tp <- subset(banksy_bin, subset = timepoint == tp)
+  p <- SpatialDimPlot(
+    obj_tp,
+    group.by     = "cell_type_annotation",
+    label        = FALSE,
+    repel        = TRUE,
+    pt.size.factor = 1.6,
+    image.alpha  = 0,
+    combine = FALSE,
+    
+  )
+  
+  fname <- paste0("res0.4_spatial_banksy_", tp, ".pdf")
+  pdf(fname)
+  print(p)
+  dev.off()
+}
+
+# Visualize UMAP per time point 
+for (tp in timepoints) {
+  
+  pdf(paste0("UMAP_timepoint_", tp, ".pdf"), width = 6, height = 6)
+  
+  print(
+    DimPlot(
+      subset(banksy_bin, subset = timepoint == tp),
+      reduction = "umap.banksy",
+      group.by = "BANKSY_snn_res.0.4",   # cluster or anything else
+      label = TRUE,
+      repel = TRUE
+    ) + ggtitle(paste("Timepoint:", tp))
+  )
+  
+  dev.off()
+}
+
+
+
+banksy_bin$timepoint <- factor(
+  banksy_bin$timepoint,
+  levels = c("Untreated", "1dpi", "3dpi", "7dpi", "14dpi", "28dpi")
+)
+
+p_time <- DimPlot(
+  banksy_bin,
+  reduction = "umap.banksy",
+  group.by  = "cell_type_annotation",  # or whatever cluster column you use
+  split.by  = "timepoint",
+  label     = TRUE,                 # <- removes text labels
+  repel     = FALSE,
+  ncol      = 3
+) +  ggtitle("") +
+  theme(
+    legend.position = "right",       # change to "none" if you want no legend
+    axis.title = element_blank(),
+    axis.text  = element_blank(),
+    axis.ticks = element_blank()
+  )
+
+pdf("UMAP_by_timepoint_res0.4_labeled.pdf", width = 15, height = 10)
+print(p_time)
+dev.off()
+
+########################### 7. SAVE RDS #########################################################
+saveRDS(banksy_bin, file = "banksy_T5-T8_res0.8.rds")
+
+################################## DEBUGGING ##################################################
