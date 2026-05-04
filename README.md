@@ -19,7 +19,7 @@ This shift allows underlying transcriptional structure to emerge. When visualize
 
 ![Post-BANKSY Clusters](./images/unlabeled_celltype_cluster.png)
 
-Together, these steps transform sparse spatial transcriptomics data into a more stable and interpretable representation by reducing noise while preserving meaningful spatial relationships.
+These steps transform sparse spatial transcriptomics data into a more stable and interpretable representation by reducing noise while preserving meaningful spatial relationships. From this point, the resulting clusters can be annotated to identify cell types or spatial domains for downstream biological interpretation.
 
 ## Dependencies
 The pipeline was developed and tested in R using the following packages:
