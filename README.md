@@ -9,11 +9,11 @@ The impact of spatial binning and neighborhood integration is reflected in how s
 
 Before applying BANKSY, the embedding is largely driven by tile identity. Cells cluster strongly by spatial origin, indicating that positional or batch-related effects dominate the signal at this stage.
 
-![Tile Identity Before BANKSY](./images/tileID_prebanksy.png)
+![Tile Identity Before BANKSY](./images/tileID_preBanksy.png)
 
 After spatial binning and BANKSY integration, this separation is reduced. The embedding becomes more mixed across tiles, suggesting that local neighborhood information has been incorporated and that the signal is no longer dominated by tile-specific effects.
 
-![Tile Identity After BANKSY](./images/tileID_postbanksy.png)
+![Tile Identity After BANKSY](./images/tileID_postBanksy.png)
 
 This shift allows underlying transcriptional structure to emerge. When visualized without tile labels, the data resolves into more coherent clusters, reflecting spatially informed domains that are more suitable for downstream biological interpretation.
 
